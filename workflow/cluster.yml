@@ -1,0 +1,69 @@
+__default__:
+    account: pkus
+    job_name: snake_job
+    mem: 10G
+    time: "200:0:0"
+    cpus: 20
+    output: outputs/slurm_%A.txt
+    partition: ibm_large
+index_bams:
+    job_name: bam_index
+    cpus: 1
+    partition: extuser
+    output: outputs/samtools_index_%A.txt
+bam_readcount:
+    job_name: bam_readcount
+    cpus: 8
+    partition: ibm_large
+    output: outputs/bam_readcount_%A.txt
+mutect2:
+    job_name: mutect2
+    time: "13-23:50"
+    cpus: 4
+    partition: phi
+    output: outputs/mutect2_%A.txt
+merge_vcf:
+    job_name: merge_vcf
+    cpus: 6
+    partition: ibm_large
+    output: outputs/merge_vcf_%A.txt
+merge_mutect_stats:
+    job_name: merge_mutect_stats
+    cpus: 6
+    partition: ibm_large
+    output: outputs/merge_mutect_stats_%A.txt
+get_pileup_summaries:
+    job_name: pileup
+    cpus: 4
+    partition: ibm_large
+    output: outputs/pileup_%A.txt
+gather_pileups:
+    job_name: gpileup
+    cpus: 1
+    partition: ibm_large
+    output: outputs/gpileup_%A.txt
+calc_contamination:
+    job_name: calc_cont
+    cpus: 1
+    partition: ibm_large
+    output: outputs/calc_cont_%A.txt
+learn_orientation:
+    job_name: learn_orientation
+    cpus: 40
+    partition: k40
+    output: outputs/learn_orientation_%A.txt
+filter_calls:
+    job_name: filter_calls
+    cpus: 1
+    partition: ibm_large
+    output: outputs/filter_calls_%A.txt
+funcotator:
+    job_name: funcotator
+    cpus: 4
+    partition: phi
+    output: outputs/funcotator_%A.txt
+vep:
+    job_name: vep
+    cpus: 1
+    partition: ibm_large
+    output: outputs/vep_%A.txt

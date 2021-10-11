@@ -1,0 +1,256 @@
+import pandas as pd
+import os
+
+os.makedirs("outputs", exist_ok=True)
+
+samples = pd.read_csv("samples.tsv", delimiter='\t')
+patients = samples.patient.unique().tolist()
+patiemts = ["map26"]
+
+genome_fasta = "genome/GRCh38.primary_assembly.genome.fa"
+N_intervals = 100
+calling_regions_interval_list = "/home/pkus/resources/gatk/wgs_calling_regions.hg38.interval_list"
+germline_resource = "~/resources/gatk/af-only-gnomad.hg38.vcf.gz"
+
+intervals_dir = "intermediate/interval_files_folder_" + str(N_intervals)
+intervals = glob_wildcards('/home/pkus/resources/gatk/scattered_intervals_100/{interval}-scattered.interval_list').interval
+
+###################################################
+############ MAIN #################################
+###################################################
+
+
+localrules: all
+
+
+rule all:
+    input:
+        # expand(intervals_dir + "/{iid}-scattered.interval_list", iid=intervals_ids),
+        expand("variants/{patient}.raw.vcf.gz", patient = patients),
+        expand("variants/{patient}.funco.vcf.gz", patient = patients),
+        expand("variants/{patient}.vep.vcf", patient = patients)
+
+
+def get_bam(sample):
+    return "/scratch/scratch-hdd/pkus/mda_czerniak_blca_maps/" + sample + ".bwa.sorted.mkdup.rg.realigned.recal.bam"
+
+
+###################################################
+############ Prepare ##############################
+###################################################
+
+
+rule prepare_intervals:
+    input:
+        genome = genome_fasta,
+    params:
+        n = N_intervals,
+        calling_regions = calling_regions_interval_list,
+        out_dir = intervals_dir
+    output: expand(intervals_dir + "/{iid}-scattered.interval_list", iid=intervals_ids)
+    shell:
+        """
+        gatk SplitIntervals \\
+            -R {input.genome} \\
+            -L {params.calling_regions} \\
+            --scatter-count {params.n} \\
+            -O {params.out_dir}
+        """
+
+
+rule index_bams:
+    input: "{file}.bam"
+    output: "{file}.bam.bai"
+    shell: "samtools index {input}"
+
+
+##############################
+############ Mutect2 part
+##############################
+
+
+def get_patient_bams(patient):
+    bams = samples.query('patient == "%s"' % patient).bam
+    return(bams.tolist())
+
+
+def get_patient_tumor_samples(patient):
+    q = 'patient == "%s" and tumor_normal == "tumor"' % patient
+    names = samples.query(q).sam_id
+    return(names)
+
+
+def get_patient_normal_samples(patient):
+    q = 'patient == "%s" and tumor_normal == "normal"' % patient
+    names = samples.query(q).sam_id
+    return(names)
+
+
+rule mutect2:
+    input:
+        bams = lambda wildcards: get_patient_bams(wildcards.patient),
+        bai = lambda wildcards: [bam + ".bai" for bam in get_patient_bams(wildcards.patient)]
+    output:
+        vcf = "intermediate/{patient}/{patient}.{interval}.vcf.gz",
+        f1r2 = "intermediate/{patient}/{patient}.{interval}.f1r2.tar.gz",
+        stats = "intermediate/{patient}/{patient}.{interval}.vcf.gz.stats"
+    params:
+        genome = genome_fasta,
+        germline_resource = germline_resource,
+        interval = intervals_dir + "/{interval}-scattered.interval_list",
+        input = lambda wildcards, input: " -I ".join(input.bams),
+        tumor_samples = lambda wildcards: " --tumor-sample ".join(get_patient_tumor_samples(wildcards.patient)),
+        normal_samples = lambda wildcards: " --normal-sample ".join(get_patient_normal_samples(wildcards.patient))
+    shell:
+        """
+        gatk Mutect2 \\
+            -I {params.input} \\
+            --normal-sample {params.normal_samples} \\
+            -R {params.genome} \\
+            -L {params.interval} \\
+            --germline-resource {params.germline_resource} \\
+            --f1r2-tar-gz {output.f1r2} \\
+            --pcr-indel-model AGGRESSIVE \\
+            -O {output.vcf}
+        """
+
+
+rule merge_vcf:
+    input: ["intermediate/{patient}/{patient}.%s.vcf.gz" % interval for interval in intervals_ids]
+    output: "variants/{patient}.raw.vcf.gz"
+    params:
+        vcfs = lambda wildcards, input: " -I ".join(input)
+    shell: "gatk MergeVcfs -I {params.vcfs} -O {output}"
+
+
+rule merge_mutect_stats:
+    input: ["intermediate/{patient}/{patient}.%s.vcf.gz.stats" % interval for interval in intervals_ids]
+    output: "intermediate/{patient}.vcf.merged_stats"
+    params:
+        input = lambda wildcards, input: " --stats ".join(input)
+    shell:
+        """
+        gatk MergeMutectStats \\
+            --output {output} \\
+            --stats {params.input}
+        """
+
+
+#################################################
+############ Contamination / segmentation part
+#################################################
+
+
+def get_patient_tissue_bams(patient, tissue):
+    q = 'patient == "%s" and tumor_normal == "%s"' % (patient, tissue)
+    bams = samples.query(q).bam
+    return(bams)
+
+
+rule get_pileup_summaries:
+    input: lambda wildcards: get_patient_tissue_bams(wildcards.patient, wildcards.tissue)
+    output: "intermediate/pileups/{patient}.{tissue}.pileups.table"
+    params:
+       input = lambda wildcards, input: " -I ".join(input)
+    shell:
+        """
+        gatk GetPileupSummaries \\
+            -I {params.input} \\
+            -L ~/resources/gatk/wgs_calling_regions.hg38.interval_list \\
+            -V ~/resources/gatk/af-only-gnomad.hg38.vcf.gz \\
+            -O {output}
+        """
+
+
+rule calc_contamination:
+    input:
+        tumor_pileup = "intermediate/pileups/{patient}.tumor.pileups.table",
+        normal_pileup = "intermediate/pileups/{patient}.normal.pileups.table"
+    output:
+        contamination = "intermediate/{patient}.contamination.table",
+        segments = "intermediate/{patient}.segments.table"
+    shell:
+        """
+        gatk CalculateContamination \\
+            -I {input.tumor_pileup} \\
+            -matched {input.normal_pileup} \\
+            -segments {output.segments} \\
+            -O {output.contamination}
+        """
+
+
+###############################################
+############ Orientation bias artifacts part
+###############################################
+
+
+rule learn_orientation:
+    input: ["intermediate/{patient}/{patient}.%s.f1r2.tar.gz" % interval for interval in intervals_ids]
+    output: "intermediate/orientation_models/{patient}.artifact_priors.tar.gz"
+    params:
+        input = lambda wildcards, input: " -I ".join(input)
+    shell:
+        """
+        gatk LearnReadOrientationModel \\
+            -I {params.input} \\
+            -O {output}
+        """
+
+
+##############################
+############ Filtering part
+##############################
+
+
+rule filter_calls:
+    input:
+        vcf = "variants/{patient}.raw.vcf.gz",
+        contamination = "intermediate/{patient}.contamination.table",
+        segments = "intermediate/{patient}.segments.table",
+        ob_priors = "intermediate/orientation_models/{patient}.artifact_priors.tar.gz",
+        stats = "intermediate/{patient}.vcf.merged_stats"
+    output:
+        vcf = "variants/{patient}.filtered.vcf.gz",
+        filtering_stats = "variants/{patient}.filtered.vcf.stats"
+    shell:
+        """
+        gatk FilterMutectCalls \\
+            -R ~/resources/hg38_for_bwa/hs38DH.fa \\
+            -V {input.vcf} \\
+            --contamination-table  {input.contamination} \\
+            --tumor-segmentation {input.segments} \\
+            --ob-priors {input.ob_priors} \\
+            --stats {input.stats} \\
+            --filtering-stats {output.filtering_stats} \\
+            -O {output.vcf}
+        """
+
+
+##########################################
+############ Annotate
+##########################################
+
+
+rule funcotator:
+    input: "variants/{patient}.vcf.gz"
+    output: "variants/{patient}.funco.vcf.gz"
+    shell:
+        """
+        ~/programs/gatk-4.1.8.0/gatk Funcotator \\
+            --variant {input} \\
+            --reference ~/resources/hg38_for_bwa/hs38DH.fa \\
+            --ref-version hg38 \\
+            --data-sources-path ~/resources/gatk/funcotator2/funcotator_dataSources.v1.7.20200521s \\
+            --output {output} \\
+            --output-file-format VCF
+        """
+
+
+rule vep:
+    input: "variants/{patient}.filtered.vcf.gz"
+    output: "variants/{patient}.vep.vcf"
+    shell:
+        """
+		export PATH=/usr/bin:$PATH
+        srun vep -i {input} -o {output} --offline --vcf
+        """
